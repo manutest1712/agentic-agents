@@ -1,12 +1,13 @@
-
-
+from lib.llm import LLM
+from lib.messages import SystemMessage, UserMessage
+from lib.parsers import JsonOutputParser, PydanticOutputParser
+from lib.tooling import tool
 from models.EvaluationReport import EvaluationReport
-from services.llm_service import LLMService
 
-
+@tool
 def evaluate_retrieval(question: str, retrieved_docs: list):
     """
-    Based on the user's question and the retrieved documents,
+    Based on the user's question and the retrieved documents from games vector db,
     evaluates whether the documents are useful to answer the question.
 
     Args:
@@ -25,6 +26,7 @@ def evaluate_retrieval(question: str, retrieved_docs: list):
             score=0.0,
             description="No retrieved documents; insufficient information to answer the question."
         )
+
 
     # LLM evaluation prompt
     system_message = """
@@ -59,31 +61,25 @@ def evaluate_retrieval(question: str, retrieved_docs: list):
     - No markdown
     - No commentary outside JSON
     - Follow this exact schema
-    
-    SCHEMA:
-    {
-      "useful": true | false,
-      "score": float (0 to 1),
-      "description": string // explanation of your decision
-    }
-    
+       
    CORING GUIDE:
     0.0 = unusable
     0.5 = partially helpful
     1.0 = fully sufficient
+    
+   Return a structured evaluation.
     """
 
-    service = LLMService()
-    # Call LLM
-    response = service.run(prompt, system_message)
+    messages = [
+        SystemMessage(content=system_message),
+        UserMessage(content=prompt)
+    ]
 
-    # Parse structured result
-    try:
-        return EvaluationReport.parse(response)
-    except Exception:
-        print("invalid json format returned")
-        return EvaluationReport(
-            useful=False,
-            score=0.0,
-            description="LLM returned invalid JSON; evaluation failed."
-        )
+    service = LLM()
+    # Call LLM
+    ai_message = service.invoke(input = messages, response_format = EvaluationReport)
+
+    parser = PydanticOutputParser(model_class=EvaluationReport)
+    report: EvaluationReport = parser.parse(ai_message)
+
+    return report
