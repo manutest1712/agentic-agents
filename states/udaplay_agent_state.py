@@ -46,3 +46,6 @@ class UdaPlayAgentState(AgentState):
 
     tool_trace: Optional[list]
     """Holds tool trace logs ."""
+
+    messages: Optional[List[dict]]  # NEW
+    session_id: str  # NEW

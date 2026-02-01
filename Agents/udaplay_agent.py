@@ -3,8 +3,9 @@ import json
 from config.settings import DEFAULT_MODEL
 from lib.agents import AgentState
 from lib.llm import LLM
+from lib.memory import ShortTermMemory
 from lib.messages import AIMessage, SystemMessage, UserMessage, ToolMessage
-from lib.state_machine import StateMachine, EntryPoint, Step, Termination
+from lib.state_machine import StateMachine, EntryPoint, Step, Termination, Run
 from states.udaplay_agent_state import UdaPlayAgentState
 
 AGENT_INSTRUCTIONS = """
@@ -22,6 +23,12 @@ class UdaPlayAgent:
         # Store tools in a dict for quick lookup
         self.tools = {tool.name: tool for tool in tools}
         print(self.tools)
+
+
+        self.workflow = self.create_state_machine()
+        self.memory = ShortTermMemory()
+
+    def create_state_machine(self) -> StateMachine[UdaPlayAgentState]:
         workflow = StateMachine[UdaPlayAgentState](UdaPlayAgentState)
 
         entry = EntryPoint[UdaPlayAgentState]()
@@ -42,11 +49,23 @@ class UdaPlayAgent:
         workflow.connect(evaluate, [answer, web_search], self.route_decision)
         workflow.connect(web_search, answer)
         workflow.connect(answer, termination)
+        return workflow
 
-        self.workflow = workflow
+    def run(self, question: str, session_id: str = "default"):
+
+        # Create session if missing
+        self.memory.create_session(session_id)
+
+        # Load previous messages
+        previous_messages = []
+        last_run: Run = self.memory.get_last_object(session_id)
+
+        if last_run:
+            last_state = last_run.get_final_state()
+            if last_state:
+                previous_messages = last_state.get("messages", [])
 
 
-    def run(self, question: str):
         initial_state: UdaPlayAgentState = {
             "user_query": question,
             "instructions": AGENT_INSTRUCTIONS,
@@ -54,12 +73,18 @@ class UdaPlayAgent:
             "evaluation_report": None,
             "reasoning_log": [],
             "tool_trace": [],
-            "final_answer": None
+            "final_answer": None,
+            "messages": previous_messages,
+            "session_id": session_id
         }
 
+
+
         result = self.workflow.run(initial_state)
-        final_state = result.state
-        return final_state["final_answer"]
+        self.memory.add(result, session_id)
+        # Safe final answer return
+        final_state = result.get_final_state() or {}
+        return final_state.get("final_answer", "No answer generated.")
 
     def retrieve_step(self, state: UdaPlayAgentState):
         tool = self.tools["retrieve_game"]
@@ -137,14 +162,31 @@ class UdaPlayAgent:
         You are UdaPlay — a gaming research assistant who can summarise gaming research details
         """
 
+        # Build conversation context
+        conversation_context = ""
+        if state.get("messages"):
+            conversation_context = "\n".join(
+                [
+                    f"User: {m.get('query')}\nAssistant: {m.get('answer')}"
+                    for m in state["messages"]
+                    if isinstance(m, dict)
+                ]
+            )
+
+        print(f"########  --- Conversation context : {conversation_context}")
+
         # LLM prompt — grounded & restricted
         synthesis_prompt = f"""      
             STRICT RULES:
             - Use ONLY the provided sources.
             - Do NOT hallucinate.
             - If info is missing, say so clearly.
+            - If conversation context helps, use it carefully.
             - Write a clear, structured final answer.
         
+            CONVERSATION CONTEXT:
+            {conversation_context}
+
             USER QUESTION:
             {state["user_query"]}
         
@@ -182,7 +224,7 @@ class UdaPlayAgent:
         -------------------------------
         TOOLS USED:
         {tool_trace}
-    
+        
         -------------------------------
         FINAL ANSWER (LLM-SYNTHESIZED):
         {final_answer_text}
@@ -194,53 +236,8 @@ class UdaPlayAgent:
         ===============================
         """
 
+        state["messages"].append({
+            "query": state["user_query"],
+            "answer": final_answer_text
+        })
         return {"final_answer": structured_report}
-
-    def llm_step(self, state: AgentState) -> UdaPlayAgentState:
-        """Step logic: Process the current state through the LLM"""
-
-        # Initialize LLM
-        llm = LLM(
-            model=DEFAULT_MODEL,
-            temperature=0.0,
-            tools=self.tools,
-        )
-
-        response = llm.invoke(state["messages"])
-        tool_calls = response.tool_calls if response.tool_calls else None
-
-        # Create AI message with content and tool calls
-        ai_message = AIMessage(content=response.content, tool_calls=tool_calls)
-
-        return {
-            "messages": state["messages"] + [ai_message],
-            "current_tool_calls": tool_calls
-        }
-
-    def tool_step(state: AgentState) -> UdaPlayAgentState:
-        """Step logic: Execute any pending tool calls"""
-        tool_calls = state["current_tool_calls"] or []
-        tool_messages = []
-
-        for call in tool_calls:
-            # Access tool call data correctly
-            function_name = call.function.name
-            function_args = json.loads(call.function.arguments)
-            tool_call_id = call.id
-            # Find the matching tool
-            tool = next((t for t in self.tools if t.name == function_name), None)
-            if tool:
-                result = tool(**function_args)
-                tool_messages.append(
-                    ToolMessage(
-                        content=json.dumps(result),
-                        tool_call_id=tool_call_id,
-                        name=function_name,
-                    )
-                )
-
-        # Clear tool calls and add results to messages
-        return {
-            "messages": state["messages"] + tool_messages,
-            "current_tool_calls": None
-        }
